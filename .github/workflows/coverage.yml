@@ -1,0 +1,103 @@
+name: Java Test Coverage
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number from upstream repo'
+        required: true
+        type: string
+      upstream_repo:
+        description: 'Upstream repo (owner/name)'
+        required: false
+        default: 'jdereg/java-util'
+        type: string
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Fetch and checkout upstream PR
+        run: |
+          git remote add upstream https://github.com/${{ inputs.upstream_repo }}.git
+          git fetch upstream pull/${{ inputs.pr_number }}/head:pr-${{ inputs.pr_number }}
+          git checkout pr-${{ inputs.pr_number }}
+      
+      - name: Set up JDK 11
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          cache: maven
+      
+      - name: Fix pom.xml for JaCoCo
+        run: sed -i 's|<argLine>|<argLine>@{argLine}|' pom.xml
+      
+      - name: Fix ConcurrentList compilation error
+        run: |
+          sed -i 's/return readOperation(() -> cursor);/return readOperation(() -> Integer.valueOf(cursor));/' src/main/java/com/cedarsoftware/util/ConcurrentList.java 2>/dev/null || true
+          sed -i 's/return readOperation(() -> cursor - 1);/return readOperation(() -> Integer.valueOf(cursor - 1));/' src/main/java/com/cedarsoftware/util/ConcurrentList.java 2>/dev/null || true
+      
+      - name: Run tests with JaCoCo
+        run: mvn clean org.jacoco:jacoco-maven-plugin:0.8.11:prepare-agent test org.jacoco:jacoco-maven-plugin:0.8.11:report
+      
+      - name: Generate line-level coverage JSON
+        run: |
+          python3 << 'EOF'
+          import xml.etree.ElementTree as ET
+          import json
+          import os
+
+          xml_path = "target/site/jacoco/jacoco.xml"
+          if not os.path.exists(xml_path):
+              print("JaCoCo XML not found")
+              exit(1)
+
+          tree = ET.parse(xml_path)
+          root = tree.getroot()
+          
+          results = {}
+          for package in root.findall('.//package'):
+              pkg_name = package.get('name', '').replace('/', '.')
+              for sourcefile in package.findall('sourcefile'):
+                  filename = sourcefile.get('name', '')
+                  path = f"{pkg_name.replace('.', '/')}/{filename}"
+                  
+                  covered, missed = [], []
+                  for line in sourcefile.findall('line'):
+                      nr = int(line.get('nr', 0))
+                      ci = int(line.get('ci', 0))
+                      if ci > 0:
+                          covered.append(nr)
+                      else:
+                          missed.append(nr)
+                  
+                  if covered or missed:
+                      total = len(covered) + len(missed)
+                      results[path] = {
+                          'covered': covered,
+                          'missed': missed,
+                          'ratio': round(len(covered) / total, 4) if total > 0 else 0
+                      }
+
+          os.makedirs('target/coverage', exist_ok=True)
+          with open('target/coverage/line-coverage.json', 'w') as f:
+              json.dump(results, f, indent=2)
+          
+          total_covered = sum(len(f['covered']) for f in results.values())
+          total_lines = sum(len(f['covered']) + len(f['missed']) for f in results.values())
+          print(f"\nCOVERAGE: {total_covered}/{total_lines} lines ({total_covered/total_lines*100:.1f}%)")
+          EOF
+      
+      - name: Upload coverage reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-pr-${{ inputs.pr_number }}
+          path: |
+            target/site/jacoco/
+            target/coverage/
+          retention-days: 30
